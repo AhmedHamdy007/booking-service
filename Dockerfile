@@ -1,14 +1,37 @@
-FROM node:20-bookworm-slim
+# Stage 1: Dependencies
+FROM node:20.19-slim AS deps
 
-ENV NODE_ENV=production
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
-COPY --chown=node:node . .
+# Stage 2: Production
+FROM node:20.19-slim AS production
 
-USER node
+WORKDIR /app
 
-EXPOSE 4003
+ENV NODE_ENV=production
+ENV PORT=3002
+
+RUN addgroup --system appgroup && \
+    adduser --system --ingroup appgroup appuser
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY src/ ./src/
+COPY migrations/ ./migrations/
+COPY scripts/ ./scripts/
+COPY shared/http/ /shared/http/
+COPY package.json ./
+
+USER appuser
+
+EXPOSE 3002
+
+HEALTHCHECK --interval=30s \
+            --timeout=5s \
+            --start-period=15s \
+            --retries=3 \
+  CMD node -e "require('http').get('http://localhost:3002/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))" || exit 1
+
 CMD ["node", "src/index.js"]

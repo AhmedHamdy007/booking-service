@@ -6,14 +6,14 @@ class ValidationError extends Error {
   }
 }
 
+const {
+  BOOKING_STATUS,
+  normalizeBookingStatus,
+  publicBookingStatus,
+} = require("./bookingTransitions");
+
 const BOOKING_STATUSES = [
-  "pending",
-  "confirmed",
-  "checked_in",
-  "in_progress",
-  "completed",
-  "cancelled",
-  "no_show",
+  ...Object.values(BOOKING_STATUS),
 ];
 
 function validateOptionalString(name, value, { maxLength = 255 } = {}) {
@@ -89,10 +89,10 @@ function validateListLimit(rawValue) {
 }
 
 function validateBookingStatus(value) {
-  const normalized = validateRequiredString("status", value, { maxLength: 40 }).toLowerCase();
+  const normalized = normalizeBookingStatus(validateRequiredString("status", value, { maxLength: 40 }));
   if (!BOOKING_STATUSES.includes(normalized)) {
     throw new ValidationError(
-      `status must be one of: ${BOOKING_STATUSES.join(", ")}`,
+      `status must be one of: ${BOOKING_STATUSES.map(publicBookingStatus).join(", ")}`,
       "status"
     );
   }

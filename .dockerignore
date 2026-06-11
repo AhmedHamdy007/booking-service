@@ -1,8 +1,54 @@
+# Dependencies - never copy into image
 node_modules
 npm-debug.log
+.npm
+
+# Environment files - secrets never in image
 .env
 .env.*
-!.env.example
-coverage
-tests
+*.env
+
+# Test files - not needed in production
+**/*.test.js
+**/*.spec.js
+**/*.test.ts
+**/*.spec.ts
+tests/
+__tests__/
+coverage/
+jest.config.js
+
+# Build artifacts
+dist/
+build/
+.cache/
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker files - no need inside image
+Dockerfile
+Dockerfile.*
+docker-compose*.yml
+.dockerignore
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation
+README.md
+docs/
+*.md
+
+# Logs
 *.log
+logs/
