@@ -1,5 +1,5 @@
 # Stage 1: Dependencies
-FROM node:20.19-slim AS deps
+FROM node:20.19-alpine AS deps
 
 WORKDIR /app
 
@@ -7,15 +7,15 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 # Stage 2: Production
-FROM node:20.19-slim AS production
+FROM node:20.19-alpine AS production
 
 WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=3002
 
-RUN addgroup --system appgroup && \
-    adduser --system --ingroup appgroup appuser
+RUN addgroup -S appgroup && \
+    adduser -S -G appgroup appuser
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY src/ ./src/

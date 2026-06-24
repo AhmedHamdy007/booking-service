@@ -22,6 +22,11 @@ jest.config.js
 dist/
 build/
 .cache/
+.nyc_output/
+tmp/
+.tmp/
+*.tsbuildinfo
+*.map
 
 # Git
 .git

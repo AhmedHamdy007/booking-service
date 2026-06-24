@@ -201,10 +201,74 @@ async function markBookingAuthorized({ booking, user, source = "user" }) {
   return updated;
 }
 
+function paymentSetupError(message, status = 400, code = null) {
+  const error = new Error(message);
+  error.status = status;
+  if (code) error.code = code;
+  return error;
+}
+
+function allowPlatformPaymentFallback() {
+  return config.nodeEnv !== "production";
+}
+
+function isConnectSetupError(error) {
+  return [
+    "stylist_payment_account_missing",
+    "stylist_payment_account_not_ready",
+    "stylist_payment_charges_disabled",
+    "payment_account_lookup_failed",
+    "payment_account_service_unavailable",
+  ].includes(error?.code);
+}
+
+function isStripeConnectDestinationError(error) {
+  const message = String(error?.message || "").toLowerCase();
+  const code = String(error?.code || "").toLowerCase();
+  return Boolean(
+    error?.type &&
+      String(error.type).startsWith("Stripe") &&
+      (
+        code.includes("account") ||
+        message.includes("connected account") ||
+        message.includes("destination") ||
+        message.includes("transfer_data") ||
+        message.includes("application_fee") ||
+        message.includes("capabilit") ||
+        message.includes("no such account")
+      )
+  );
+}
+
+async function createPlatformFallbackPaymentIntent({ client, params, bookingId, reason, requestId }) {
+  const fallbackParams = {
+    ...params,
+    application_fee_amount: undefined,
+    transfer_data: undefined,
+    metadata: {
+      ...params.metadata,
+      connectMode: "platform_fallback",
+      connectFallbackReason: String(reason || "connect_unavailable").slice(0, 120),
+    },
+  };
+
+  return client.paymentIntents.create(fallbackParams, {
+    idempotencyKey: `balance_intent_${bookingId}_platform_fallback_${params.amount}_v3`,
+  });
+}
+
 function bookingTotalAmount(booking) {
   const stored = Number.parseInt(String(booking.amountTotal || 0), 10);
   if (Number.isInteger(stored) && stored > 0) return stored;
-  return amountInMinorUnit(booking.effectivePrice);
+
+  try {
+    const amount = amountInMinorUnit(booking.effectivePrice);
+    if (Number.isInteger(amount) && amount > 0) return amount;
+  } catch {
+    // Re-throw below with checkout-specific wording.
+  }
+
+  throw paymentSetupError("Booking amount is invalid. Recreate this booking or update the service price before paying.", 400, "invalid_booking_amount");
 }
 
 function assertPaymentRetryable(booking) {
@@ -249,27 +313,60 @@ function canRefund(booking) {
 }
 
 async function requireReadyStylistConnectAccount({ stylistUserId, requestId }) {
-  const upstream = await getStylistConnectAccount({ stylistUserId, requestId });
+  let upstream;
+  try {
+    upstream = await getStylistConnectAccount({ stylistUserId, requestId });
+  } catch (error) {
+    const wrapped = paymentSetupError(
+      "Unable to verify the stylist payment account. Please check that shop-service is running and reachable.",
+      503,
+      "payment_account_lookup_failed"
+    );
+    wrapped.cause = error;
+    throw wrapped;
+  }
+
+  if (upstream.status === 404) {
+    throw paymentSetupError(
+      "Stylist payment account is not set up yet. Ask the stylist to complete Stripe onboarding before customers pay.",
+      400,
+      "stylist_payment_account_missing"
+    );
+  }
+
+  if (upstream.status >= 500) {
+    throw paymentSetupError(
+      "Unable to verify the stylist payment account right now. Please retry after the services are healthy.",
+      503,
+      "payment_account_service_unavailable"
+    );
+  }
+
   if (upstream.status !== 200) {
-    const error = new Error("Stylist payment account not ready");
-    error.status = 400;
-    throw error;
+    throw paymentSetupError("Stylist payment account not ready", 400, "stylist_payment_account_not_ready");
   }
 
   const account = upstream.body?.data;
-  if (!account?.stripeAccountId || account.chargesEnabled !== true) {
-    const error = new Error("Stylist payment account not ready");
-    error.status = 400;
-    throw error;
+  if (!account?.stripeAccountId) {
+    throw paymentSetupError(
+      "Stylist payment account is not set up yet. Ask the stylist to complete Stripe onboarding before customers pay.",
+      400,
+      "stylist_payment_account_missing"
+    );
   }
+
+  if (account.chargesEnabled !== true) {
+    throw paymentSetupError(
+      "Stylist payment account cannot accept charges yet. Finish Stripe onboarding and refresh the account status.",
+      400,
+      "stylist_payment_charges_disabled"
+    );
+  }
+
   return account;
 }
 
 async function buildCheckoutPaymentIntent({ client, booking, user, stylistId, requestId }) {
-  const stylistAccount = await requireReadyStylistConnectAccount({
-    stylistUserId: stylistId,
-    requestId,
-  });
   const totalAmount = bookingTotalAmount(booking);
   const depositAmount = Number.parseInt(String(booking.depositAmount || 0), 10) || 0;
   const balanceAmount = Number.parseInt(String(booking.balanceAmount || Math.max(totalAmount - depositAmount, 0)), 10);
@@ -278,36 +375,72 @@ async function buildCheckoutPaymentIntent({ client, booking, user, stylistId, re
     error.status = 400;
     throw error;
   }
+
   const platformFee = Math.floor(balanceAmount * platformFeePercent());
   const stylistPayout = Math.max(balanceAmount - platformFee, 0);
   const stripeCustomerId = await resolveStripeCustomerId(client, booking, user);
 
-  const paymentIntent = await client.paymentIntents.create(
-    {
-      amount: balanceAmount,
-      currency: CURRENCY,
-      customer: stripeCustomerId,
-      capture_method: "manual",
-      application_fee_amount: platformFee,
-      transfer_data: {
-        destination: stylistAccount.stripeAccountId,
-      },
-      transfer_group: bookingTransferGroup(booking.id),
-      metadata: {
-        bookingId: String(booking.id),
-        customerId: String(user.id),
-        stylistId: String(stylistId),
-        type: "balance",
-        depositAmount: String(depositAmount),
-        balanceAmount: String(balanceAmount),
-        totalAmount: String(totalAmount),
-        platformFee: String(platformFee),
-        stylistPayout: String(stylistPayout),
-      },
-      automatic_payment_methods: { enabled: true },
+  let stylistAccount = null;
+  let connectMode = "destination_charge";
+  try {
+    stylistAccount = await requireReadyStylistConnectAccount({
+      stylistUserId: stylistId,
+      requestId,
+    });
+  } catch (error) {
+    if (!allowPlatformPaymentFallback() || !isConnectSetupError(error)) {
+      throw error;
+    }
+    connectMode = "platform_fallback";
+  }
+
+  const paymentIntentParams = {
+    amount: balanceAmount,
+    currency: CURRENCY,
+    customer: stripeCustomerId,
+    capture_method: "manual",
+    transfer_group: bookingTransferGroup(booking.id),
+    metadata: {
+      bookingId: String(booking.id),
+      customerId: String(user.id),
+      stylistId: String(stylistId),
+      type: "balance",
+      depositAmount: String(depositAmount),
+      balanceAmount: String(balanceAmount),
+      totalAmount: String(totalAmount),
+      platformFee: String(platformFee),
+      stylistPayout: String(stylistPayout),
+      connectMode,
     },
-    { idempotencyKey: `balance_intent_${booking.id}_v2` }
-  );
+    automatic_payment_methods: { enabled: true },
+  };
+
+  if (connectMode === "destination_charge" && stylistAccount?.stripeAccountId) {
+    paymentIntentParams.application_fee_amount = platformFee;
+    paymentIntentParams.transfer_data = {
+      destination: stylistAccount.stripeAccountId,
+    };
+  }
+
+  let paymentIntent;
+  try {
+    paymentIntent = await client.paymentIntents.create(
+      paymentIntentParams,
+      { idempotencyKey: `balance_intent_${booking.id}_${connectMode}_${user.id}_${balanceAmount}_v3` }
+    );
+  } catch (error) {
+    if (!allowPlatformPaymentFallback() || !isStripeConnectDestinationError(error)) {
+      throw error;
+    }
+    connectMode = "platform_fallback";
+    paymentIntent = await createPlatformFallbackPaymentIntent({
+      client,
+      params: paymentIntentParams,
+      bookingId: booking.id,
+      reason: error.code || error.message || "stripe_connect_destination_failed",
+      requestId,
+    });
+  }
 
   await updateBookingById(booking.id, {
     payment_intent_id: paymentIntent.id,
@@ -318,7 +451,7 @@ async function buildCheckoutPaymentIntent({ client, booking, user, stylistId, re
     balance_platform_fee: platformFee,
     balance_stylist_payout: stylistPayout,
     balance_status: BALANCE_STATUS.UNPAID,
-    payment_status: "pending",
+    payment_status: "unpaid",
     currency: CURRENCY,
   });
 
@@ -327,9 +460,9 @@ async function buildCheckoutPaymentIntent({ client, booking, user, stylistId, re
     totalAmount: balanceAmount,
     platformFee,
     stylistPayout,
+    connectMode,
   };
 }
-
 async function retrieveReusablePaymentIntent({ client, booking }) {
   const intentId = booking.balancePaymentIntentId || booking.paymentIntentId;
   if (!intentId) return null;
@@ -391,6 +524,7 @@ async function handleCreateCheckout(req, res, next) {
           totalAmount: existingIntent.amount || booking.balanceAmount,
           platformFee: booking.balancePlatformFee,
           stylistPayout: booking.balanceStylistPayout,
+          connectMode: existingIntent.metadata?.connectMode || "destination_charge",
         }
       : await buildCheckoutPaymentIntent({
           client,
@@ -407,6 +541,10 @@ async function handleCreateCheckout(req, res, next) {
       platformFee: checkout.platformFee,
       stylistPayout: checkout.stylistPayout,
       currency: CURRENCY,
+      paymentMode: checkout.connectMode || "destination_charge",
+      setupWarning: checkout.connectMode === "platform_fallback"
+        ? "Stripe Connect is not ready for this stylist, so this VM is using a platform-only test payment."
+        : undefined,
     });
   } catch (error) {
     if (error instanceof ValidationError) return next(error);
